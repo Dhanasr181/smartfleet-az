@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment variables - NEVER commit secrets
+.env
+*.env
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+*.log
+
+# Azure
+*.publishsettings
+local.settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

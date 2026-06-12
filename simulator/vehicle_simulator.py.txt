@@ -1,0 +1,220 @@
+"""
+SmartFleet AZ - Vehicle Telemetry Simulator
+Simulates 50 vehicles publishing CAN bus signals via MQTT at 10Hz
+Author: Dhanasekhara Reddy Goddeti
+"""
+
+import json
+import time
+import random
+import logging
+import os
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────
+MQTT_HOST         = os.getenv("MQTT_BROKER_HOST", "localhost")
+MQTT_PORT         = int(os.getenv("MQTT_BROKER_PORT", 1883))
+NUM_VEHICLES      = int(os.getenv("NUM_VEHICLES", 50))
+INTERVAL_MS       = int(os.getenv("SIMULATION_INTERVAL_MS", 100))  # 10Hz
+MQTT_TOPIC_PREFIX = "smartfleet/vehicles"
+
+
+# ── Vehicle signal ranges (real CAN bus values) ───────────────────────
+NORMAL_RANGES = {
+    "speed_kmh":         (0,   120),
+    "engine_rpm":        (700, 3500),
+    "engine_temp_c":     (75,  98),
+    "battery_voltage_v": (13.2, 14.8),
+    "brake_pressure_bar":(0,   80),
+    "throttle_pct":      (0,   100),
+    "oil_pressure_bar":  (2.0, 5.0),
+    "fuel_level_pct":    (10,  100),
+}
+
+# Anomaly ranges — triggers when vehicle enters fault state
+ANOMALY_RANGES = {
+    "engine_temp_c":     (105, 125),   # overheating
+    "battery_voltage_v": (11.0, 12.5), # weak battery
+    "oil_pressure_bar":  (0.5, 1.5),   # low oil pressure
+    "engine_rpm":        (4500, 6000), # over-rev
+}
+
+
+@dataclass
+class VehicleState:
+    vehicle_id: str
+    vin: str
+    make: str
+    model: str
+    is_anomaly: bool = False
+    anomaly_type: str = None
+
+
+@dataclass
+class TelemetryPayload:
+    vehicle_id:          str
+    vin:                 str
+    make:                str
+    model:               str
+    timestamp_utc:       str
+    speed_kmh:           float
+    engine_rpm:          float
+    engine_temp_c:       float
+    battery_voltage_v:   float
+    brake_pressure_bar:  float
+    throttle_pct:        float
+    oil_pressure_bar:    float
+    fuel_level_pct:      float
+    is_anomaly:          bool
+    anomaly_type:        str
+
+
+def generate_vin(vehicle_num: int) -> str:
+    """Generate a realistic-looking VIN."""
+    return f"SF{vehicle_num:04d}AZ2026DLH{vehicle_num:03d}"
+
+
+def build_fleet(num_vehicles: int) -> list[VehicleState]:
+    """Initialise fleet with vehicle metadata."""
+    makes_models = [
+        ("Toyota", "Fortuner"), ("Hyundai", "Creta"),
+        ("Tata", "Nexon"),      ("Mahindra", "Scorpio"),
+        ("Honda", "City"),      ("Suzuki", "Brezza"),
+    ]
+    fleet = []
+    for i in range(1, num_vehicles + 1):
+        make, model = makes_models[i % len(makes_models)]
+        fleet.append(VehicleState(
+            vehicle_id=f"VH-{i:04d}",
+            vin=generate_vin(i),
+            make=make,
+            model=model,
+        ))
+    return fleet
+
+
+def get_signal_value(signal: str, is_anomaly: bool, anomaly_type: str) -> float:
+    """Return a realistic signal value, anomalous if in fault state."""
+    if is_anomaly and anomaly_type and signal in ANOMALY_RANGES:
+        low, high = ANOMALY_RANGES[signal]
+    else:
+        low, high = NORMAL_RANGES[signal]
+    # Add small Gaussian noise for realism
+    value = random.uniform(low, high)
+    noise = random.gauss(0, (high - low) * 0.01)
+    return round(max(low - 1, min(high + 1, value + noise)), 2)
+
+
+def maybe_trigger_anomaly(vehicle: VehicleState) -> VehicleState:
+    """
+    Randomly trigger or clear anomaly states.
+    ~3% chance to enter anomaly, ~20% chance to recover each cycle.
+    """
+    if vehicle.is_anomaly:
+        if random.random() < 0.20:  # 20% recovery chance
+            vehicle.is_anomaly = False
+            vehicle.anomaly_type = None
+            logger.info(f"RECOVERED | {vehicle.vehicle_id}")
+    else:
+        if random.random() < 0.03:  # 3% anomaly trigger chance
+            vehicle.is_anomaly = True
+            vehicle.anomaly_type = random.choice(list(ANOMALY_RANGES.keys()))
+            logger.warning(f"ANOMALY TRIGGERED | {vehicle.vehicle_id} | {vehicle.anomaly_type}")
+    return vehicle
+
+
+def build_payload(vehicle: VehicleState) -> TelemetryPayload:
+    """Build a full telemetry payload for one vehicle."""
+    return TelemetryPayload(
+        vehicle_id         = vehicle.vehicle_id,
+        vin                = vehicle.vin,
+        make               = vehicle.make,
+        model              = vehicle.model,
+        timestamp_utc      = datetime.now(timezone.utc).isoformat(),
+        speed_kmh          = get_signal_value("speed_kmh", vehicle.is_anomaly, vehicle.anomaly_type),
+        engine_rpm         = get_signal_value("engine_rpm", vehicle.is_anomaly, vehicle.anomaly_type),
+        engine_temp_c      = get_signal_value("engine_temp_c", vehicle.is_anomaly, vehicle.anomaly_type),
+        battery_voltage_v  = get_signal_value("battery_voltage_v", vehicle.is_anomaly, vehicle.anomaly_type),
+        brake_pressure_bar = get_signal_value("brake_pressure_bar", vehicle.is_anomaly, vehicle.anomaly_type),
+        throttle_pct       = get_signal_value("throttle_pct", vehicle.is_anomaly, vehicle.anomaly_type),
+        oil_pressure_bar   = get_signal_value("oil_pressure_bar", vehicle.is_anomaly, vehicle.anomaly_type),
+        fuel_level_pct     = get_signal_value("fuel_level_pct", vehicle.is_anomaly, vehicle.anomaly_type),
+        is_anomaly         = vehicle.is_anomaly,
+        anomaly_type       = vehicle.anomaly_type or "none",
+    )
+
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        logger.info("Connected to MQTT broker successfully")
+    else:
+        logger.error(f"MQTT connection failed with code {rc}")
+
+
+def on_publish(client, userdata, mid, reason_code=None, properties=None):
+    pass  # suppress per-message logs for performance
+
+
+def run_simulator():
+    """Main simulation loop — publishes all 50 vehicles at 10Hz."""
+    fleet = build_fleet(NUM_VEHICLES)
+    logger.info(f"Fleet initialised: {NUM_VEHICLES} vehicles")
+
+    # ── MQTT client setup ─────────────────────────────────────────────
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="smartfleet-simulator")
+    client.on_connect = on_connect
+    client.on_publish = on_publish
+
+    logger.info(f"Connecting to MQTT broker at {MQTT_HOST}:{MQTT_PORT}")
+    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.loop_start()
+
+    interval_sec = INTERVAL_MS / 1000.0
+    total_published = 0
+
+    logger.info(f"Starting simulation at {1/interval_sec:.1f}Hz per vehicle...")
+
+    try:
+        while True:
+            cycle_start = time.time()
+
+            for vehicle in fleet:
+                # Maybe flip anomaly state
+                vehicle = maybe_trigger_anomaly(vehicle)
+
+                # Build and publish payload
+                payload = build_payload(vehicle)
+                topic   = f"{MQTT_TOPIC_PREFIX}/{vehicle.vehicle_id}/telemetry"
+                message = json.dumps(asdict(payload))
+
+                client.publish(topic, message, qos=1)
+                total_published += 1
+
+            # Stats every 1000 publishes
+            if total_published % 1000 == 0:
+                anomaly_count = sum(1 for v in fleet if v.is_anomaly)
+                logger.info(
+                    f"Published: {total_published:,} messages | "
+                    f"Active anomalies: {anomaly_count}/{NUM_VEHICLES}"
+                )
+
+            # Maintain 10Hz timing
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0, interval_sec - elapsed)
+            time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        logger.info(f"Simulation stopped. Total messages published: {total_published:,}")
+        client.loop_stop()
+        client.disconnect()
+
+
+if __name__ == "__main__":
+    run_simulator()
